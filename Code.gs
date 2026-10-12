@@ -131,6 +131,15 @@ function handleRequest_(p) {
   }
 }
 
+/* ===== JEMBATAN FRONTEND (google.script.run) ===== */
+// Dipanggil oleh index.html saat aplikasi di-host langsung oleh Apps Script
+// (HtmlService). google.script.run hanya bisa memanggil fungsi global dengan
+// parameter/return data JSON biasa, jadi seluruh request dibungkus menjadi
+// satu payload — sama persis seperti doGet/doPost.
+function apiServerCall(payload){
+  return handleRequest_(payload || {});
+}
+
 function routeAction_(action, p, session) {
   switch(action) {
     case 'ping': return ok_('Koneksi Apps Script berhasil.', {school:CONFIG.SCHOOL_NAME});

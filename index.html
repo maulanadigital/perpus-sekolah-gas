@@ -98,6 +98,9 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;p
 .progress span{display:block;height:100%;background:var(--blue);border-radius:99px}
 .report-tools{display:flex;gap:9px;flex-wrap:wrap;margin-top:14px}
 .report-tools button{border-radius:9px;padding:10px 13px;font-weight:800;font-size:12px}.table-actions{display:flex;gap:5px;white-space:nowrap}.mini{border:1px solid var(--border);border-radius:7px;background:#fff;padding:6px 8px;font-size:10px;font-weight:800}.mini.edit{color:var(--blue)}.mini.delete{color:var(--red)}.form-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:4px 14px}.form-grid .field{margin-bottom:10px}.form-info{padding:10px 12px;background:#f5f8fc;border:1px solid var(--border);border-radius:9px;color:var(--muted);font-size:12px;line-height:1.6}.form-info .badge{margin-left:7px}.return-card{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;padding:14px;background:#f7faff;border:1px solid var(--border);border-radius:10px;font-size:13px}.return-card .action{grid-column:1/-1;justify-self:start}.report-note{background:#f7f9fc;border:1px solid var(--border);border-radius:9px;padding:11px 13px;color:var(--muted);font-size:12px;line-height:1.6}.annual-preview{margin-top:12px}.annual-summary{background:#f6f9fd;border:1px solid var(--border);border-radius:9px;padding:10px 12px;font-size:12px;line-height:1.7}.annual-summary .ok{color:var(--green)}.annual-summary .danger{color:var(--red)}.action-select{border:1px solid var(--border);border-radius:8px;padding:7px 9px;background:#fff;font-size:11px;font-weight:700}
+
+.login-error{margin:0 0 16px;padding:11px 13px;border-radius:10px;background:#fdebed;border:1px solid #f3c2c8;color:#b3261e;font-size:13px;font-weight:600;line-height:1.55;word-break:break-word}
+.api-status{text-align:center;font-size:11px;font-weight:700;color:var(--muted);margin:-18px 0 18px}
 .report-note{font-size:12px;color:var(--muted);line-height:1.6}
 @media(max-width:800px){.report-grid{grid-template-columns:1fr}.member-actions{flex-direction:column}}
 
@@ -123,6 +126,8 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;p
     <h1>PERPUSTAKAAN DIGITAL</h1>
     <div class="sub" id="schoolNameLogin">SMKN JATENG DI SEMARANG</div>
     <div class="desc">Masuk untuk melanjutkan ke aplikasi perpustakaan.</div>
+    <div id="apiStatus" class="api-status">● Mengecek koneksi database...</div>
+    <div id="loginError" class="login-error hidden"></div>
     <form id="loginForm">
       <div class="field"><label>NIS / Username</label><input id="username" required placeholder="Masukkan username"></div>
       <div class="field"><label>Password</label><input id="password" type="password" required placeholder="Masukkan password"></div>
@@ -175,18 +180,39 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;p
 function resolveApiUrl(){
   if(window.PERPUS_CONFIG && window.PERPUS_CONFIG.apiUrl) return String(window.PERPUS_CONFIG.apiUrl).trim();
   // Dihosting langsung oleh Apps Script (HtmlService) -> API berada di URL yang sama.
+  // Catatan: halaman app berjalan di dalam iframe *.googleusercontent.com dengan
+  // prefiks acak (mis. "n-xxxx-script.googleusercontent.com"), jadi pencocokan
+  // host memakai includes() agar tidak hanya cocok saat host diawali persis.
   const host=location.host||"";
-  if(host.indexOf("script.google")===0 || host.indexOf("script.googleusercontent.com")===0){
+  if(host.indexOf("script.google")>-1 || host.indexOf("script.googleusercontent.com")>-1){
     return location.origin + location.pathname.replace(/\/config\.js$/,"");
   }
   return "";
 }
 const API_URL = resolveApiUrl();
+// Jika halaman ini disajikan langsung oleh Apps Script (HtmlService), panggilan
+// server memakai google.script.run: tidak bergantung URL API, bebas CORS, dan
+// bekerja walau halaman berjalan di dalam iframe sandbox Google.
+const GAS_HOSTED = !!(window.google && window.google.script && window.google.script.run);
 
 const TOKEN_STORAGE_KEY="PERPUS_SESSION_TOKEN";
-function getSessionToken(){try{return sessionStorage.getItem(TOKEN_STORAGE_KEY)||"";}catch(e){return "";}}
-function setSessionToken(token){try{token?sessionStorage.setItem(TOKEN_STORAGE_KEY,String(token)):sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}}
-function clearSessionToken(){try{sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}}
+// Token disimpan di memori halaman (utama) + sessionStorage (fallback). Di mode
+// di-host GAS, sandbox iframe dapat membatasi akses sessionStorage sebelum ada
+// interaksi pengguna, jadi variabel memori dijadikan sumber utama.
+let currentToken="";
+function getSessionToken(){
+  if(currentToken) return currentToken;
+  try{currentToken=sessionStorage.getItem(TOKEN_STORAGE_KEY)||"";}catch(e){}
+  return currentToken;
+}
+function setSessionToken(token){
+  currentToken=String(token||"");
+  try{currentToken?sessionStorage.setItem(TOKEN_STORAGE_KEY,currentToken):sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}
+}
+function clearSessionToken(){
+  currentToken="";
+  try{sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}
+}
 
 function forceLogout(message){
   currentUser=null;
@@ -200,36 +226,50 @@ function forceLogout(message){
 let apiOnline = false;
 
 async function apiRequest(action, params={}){
-  if(!API_URL)return {success:false,message:"Konfigurasi server belum diatur. Isi apiUrl di config.js."};
   try{
     const token=getSessionToken();
     const payload={action,...params,...(token?{token}:{})};
-    const hasFilePayload=!!(payload.coverBase64||payload.base64);
-    let response;
-    if(hasFilePayload){
-      response=await fetch(API_URL,{
-        method:"POST",
-        headers:{"Content-Type":"text/plain;charset=utf-8"},
-        body:JSON.stringify(payload),
-        cache:"no-store"
+    let data;
+    if(GAS_HOSTED){
+      // Mode di-host Apps Script: panggil fungsi server via google.script.run.
+      data=await new Promise((resolve,reject)=>{
+        window.google.script.run
+          .withSuccessHandler(resolve)
+          .withFailureHandler(err=>reject(err||new Error("Panggilan server gagal.")))
+          .apiServerCall(payload);
       });
     }else{
-      const query=new URLSearchParams(payload);
-      response=await fetch(API_URL+"?"+query.toString(),{
-        method:"GET",
-        cache:"no-store"
-      });
+      // Mode hosting eksternal: fetch ke URL API (dari config.js / URL /exec).
+      if(!API_URL)return {success:false,message:"Konfigurasi server belum diatur. Isi apiUrl di config.js."};
+      const hasFilePayload=!!(payload.coverBase64||payload.base64);
+      let response;
+      if(hasFilePayload){
+        response=await fetch(API_URL,{
+          method:"POST",
+          headers:{"Content-Type":"text/plain;charset=utf-8"},
+          body:JSON.stringify(payload),
+          cache:"no-store"
+        });
+      }else{
+        const query=new URLSearchParams(payload);
+        response=await fetch(API_URL+"?"+query.toString(),{
+          method:"GET",
+          cache:"no-store"
+        });
+      }
+      data=await response.json();
     }
-    const data=await response.json();
+    if(!data||typeof data!=="object")data={success:false,message:"Respons server tidak dikenali."};
     apiOnline=!!data.success;
-    if(data && data.success===false && data.code==="AUTH"){
+    if(data.success===false && data.code==="AUTH"){
       clearSessionToken();
       if(currentUser) forceLogout("Sesi Anda telah berakhir. Silakan login kembali.");
     }
     return data;
   }catch(error){
     apiOnline=false;
-    return {success:false,message:"Tidak dapat terhubung ke server perpustakaan."};
+    const reason=(error&&error.message)?error.message:"error";
+    return {success:false,message:"Tidak dapat terhubung ke server perpustakaan. ("+reason+")"};
   }
 }
 
@@ -331,14 +371,26 @@ function login(user){
  showPage(isAdmin?"admin":(isLibrarian?"borrow":"dashboard"));
 }
 
+function showLoginError(msg){
+  const el=document.getElementById("loginError");
+  if(!el){toast(msg);return;}
+  el.textContent=msg;
+  el.classList.remove("hidden");
+}
+function clearLoginError(){
+  const el=document.getElementById("loginError");
+  if(el){el.classList.add("hidden");el.textContent="";}
+}
+
 document.getElementById("loginForm").addEventListener("submit",async e=>{
  e.preventDefault();
+ clearLoginError();
 
  const username=document.getElementById("username").value.trim();
  const password=document.getElementById("password").value;
 
  if(!username || !password){
-   toast("Username/NIS dan password wajib diisi.");
+   showLoginError("Username/NIS dan password wajib diisi.");
    return;
  }
 
@@ -366,7 +418,7 @@ document.getElementById("loginForm").addEventListener("submit",async e=>{
      }
    }
  }else{
-   toast(result.message || "Login gagal.");
+   showLoginError(result.message || "Login gagal. Silakan coba lagi.");
  }
 
  if(submit){submit.disabled=false;submit.textContent="Masuk";}
