@@ -172,13 +172,38 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{text-align:left;p
 
 <script src="config.js"></script>
 <script>
-const API_URL = window.PERPUS_CONFIG && window.PERPUS_CONFIG.apiUrl;
+function resolveApiUrl(){
+  if(window.PERPUS_CONFIG && window.PERPUS_CONFIG.apiUrl) return String(window.PERPUS_CONFIG.apiUrl).trim();
+  // Dihosting langsung oleh Apps Script (HtmlService) -> API berada di URL yang sama.
+  const host=location.host||"";
+  if(host.indexOf("script.google")===0 || host.indexOf("script.googleusercontent.com")===0){
+    return location.origin + location.pathname.replace(/\/config\.js$/,"");
+  }
+  return "";
+}
+const API_URL = resolveApiUrl();
+
+const TOKEN_STORAGE_KEY="PERPUS_SESSION_TOKEN";
+function getSessionToken(){try{return sessionStorage.getItem(TOKEN_STORAGE_KEY)||"";}catch(e){return "";}}
+function setSessionToken(token){try{token?sessionStorage.setItem(TOKEN_STORAGE_KEY,String(token)):sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}}
+function clearSessionToken(){try{sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch(e){}}
+
+function forceLogout(message){
+  currentUser=null;
+  serverDataLoaded=false;
+  document.getElementById("app").classList.add("hidden");
+  document.getElementById("loginPage").classList.remove("hidden");
+  document.getElementById("loginForm").reset();
+  if(message) toast(message);
+}
+
 let apiOnline = false;
 
 async function apiRequest(action, params={}){
   if(!API_URL)return {success:false,message:"Konfigurasi server belum diatur. Isi apiUrl di config.js."};
   try{
-    const payload={action,...params};
+    const token=getSessionToken();
+    const payload={action,...params,...(token?{token}:{})};
     const hasFilePayload=!!(payload.coverBase64||payload.base64);
     let response;
     if(hasFilePayload){
@@ -197,6 +222,10 @@ async function apiRequest(action, params={}){
     }
     const data=await response.json();
     apiOnline=!!data.success;
+    if(data && data.success===false && data.code==="AUTH"){
+      clearSessionToken();
+      if(currentUser) forceLogout("Sesi Anda telah berakhir. Silakan login kembali.");
+    }
     return data;
   }catch(error){
     apiOnline=false;
@@ -319,7 +348,13 @@ document.getElementById("loginForm").addEventListener("submit",async e=>{
  const result=await apiRequest("login",{username,password});
 
  if(result.success && result.user){
+   if(result.token) setSessionToken(result.token);
    login(result.user);
+
+   // Muat data perpustakaan setelah sesi terbentuk (request membutuhkan token).
+   const dataResult=await refreshServerData(false);
+   if(dataResult.success) showPage(currentPageName||"dashboard"); // render ulang dengan data terbaru
+   else toast(dataResult.message||"Data perpustakaan belum dapat dimuat.");
 
    // Load the logged-in member's personal data from Google Sheets.
    if(result.user.idAnggota){
@@ -353,7 +388,7 @@ async function ensureMyDataLoaded(){
   return false;
 }
 
-document.getElementById("logoutBtn").onclick=()=>{currentUser=null;document.getElementById("app").classList.add("hidden");document.getElementById("loginPage").classList.remove("hidden");document.getElementById("loginForm").reset()};
+document.getElementById("logoutBtn").onclick=()=>{clearSessionToken();forceLogout();};
 document.querySelectorAll(".nav-btn[data-page]").forEach(b=>{
   b.onclick=async ()=>{
     const page=b.dataset.page;
@@ -989,23 +1024,31 @@ function openMemberForm(editId=null){
  <div class="modal-actions"><button class="secondary" onclick="closeModal()">Batal</button><button class="action" onclick="saveMember('${editId||""}')">Simpan Anggota</button></div>`;
  document.getElementById("modalWrap").classList.remove("hidden");
 }
-function saveMember(editId){
+async function saveMember(editId){
  const id=document.getElementById("mId").value.trim(),name=document.getElementById("mName").value.trim(),nis=document.getElementById("mNis").value.trim();
  if(!id||!name||!nis){toast("ID, nama, dan NIS/NIP wajib diisi.");return}
  const obj={id,name,nis,kelas:document.getElementById("mKelas").value.trim(),jurusan:document.getElementById("mJurusan").value.trim(),jenis:document.getElementById("mJenis").value,status:"Aktif",loans:[],returned:[],outstanding:"Tidak ada tanggungan"};
- if(editId){const i=membersData.findIndex(x=>x.id===editId);if(i>-1){obj.status=membersData[i].status;obj.loans=membersData[i].loans;obj.returned=membersData[i].returned;obj.outstanding=membersData[i].outstanding;membersData[i]=obj;}}
- else {if(membersData.some(x=>x.id===id)){toast("ID Anggota sudah digunakan.");return}membersData.push(obj);}
+ if(editId){const i=membersData.findIndex(x=>x.id===editId);if(i>-1)obj.status=membersData[i].status;}
+ else if(membersData.some(x=>x.id===id)){toast("ID Anggota sudah digunakan.");return}
+ const r=await apiRequest("saveMember",{idAnggota:id,nisNip:nis,nama:name,kelas:obj.kelas,jurusan:obj.jurusan,jenisAnggota:obj.jenis,status:obj.status});
+ if(!r.success){toast(r.message||"Anggota gagal disimpan ke database.");return;}
+ if(editId){const i=membersData.findIndex(x=>x.id===editId);if(i>-1){obj.loans=membersData[i].loans;obj.returned=membersData[i].returned;obj.outstanding=membersData[i].outstanding;membersData[i]=obj;}}
+ else membersData.push(obj);
  closeModal();toast(editId?"Data anggota berhasil diubah.":"Anggota baru berhasil ditambahkan.");showPage("members");
 }
 function editMember(id){openMemberForm(id)}
-function setMemberStatus(id,status){
+async function setMemberStatus(id,status){
  const m=membersData.find(x=>x.id===id); if(!m)return;
+ const r=await apiRequest("setMemberStatus",{idAnggota:id,status});
+ if(!r.success){toast(r.message||"Status anggota gagal diperbarui.");return;}
  m.status=status; toast(`${m.name} sekarang berstatus ${status}.`); showPage("members");
 }
-function deleteMember(id){
+async function deleteMember(id){
  const m=membersData.find(x=>x.id===id); if(!m)return;
  if(!confirm(`Hapus anggota ${m.name}? Gunakan hanya untuk siswa yang sudah lulus/keluar.`))return;
- membersData=membersData.filter(x=>x.id!==id);toast("Anggota berhasil dihapus.");showPage("members");
+ const r=await apiRequest("deleteMember",{idAnggota:id});
+ if(!r.success){toast(r.message||"Anggota gagal dinonaktifkan.");return;}
+ membersData=membersData.filter(x=>x.id!==id);toast("Anggota berhasil ditandai Lulus/keluar.");showPage("members");
 }
 
 
@@ -1292,12 +1335,15 @@ async function loadTransactionPageData(){
 function toast(msg){const t=document.getElementById("toast");t.textContent=msg;t.classList.remove("hidden");clearTimeout(window.tt);window.tt=setTimeout(()=>t.classList.add("hidden"),2800)}
 
 (async function initServerConnection(){
- const all=await refreshServerData(true);
- const statusEl=document.getElementById("apiStatus");
- if(statusEl) statusEl.textContent=all.success?"● Database terhubung":"● Database belum terhubung";
- if(statusEl) statusEl.style.color=all.success?"#18864b":"#c62828";
- applySchoolBranding();
-  if(!all.success) console.warn("Apps Script belum terhubung:", all.message);
+  // Sebelum login hanya pengaturan (branding) yang dibuka; data perpustakaan dimuat setelah login.
+  const s=await apiRequest("settings");
+  if(s && s.success && s.settings) reportSettings=s.settings;
+  const statusEl=document.getElementById("apiStatus");
+  const ok=!!(s && s.success);
+  if(statusEl) statusEl.textContent=ok?"● Database terhubung":"● Database belum terhubung";
+  if(statusEl) statusEl.style.color=ok?"#18864b":"#c62828";
+  applySchoolBranding();
+  if(!ok) console.warn("Apps Script belum terhubung:", s && s.message);
 })();
 </script>
 </body>
